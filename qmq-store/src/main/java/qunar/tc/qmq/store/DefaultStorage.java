@@ -54,7 +54,8 @@ public class DefaultStorage implements Storage {
     private final CheckpointManager checkpointManager;
 
     private final SortedMessagesTable sortedMessagesTable;
-    private final MessageMemTableManager memTableManager;
+    private final MemTableManager memTableManager;
+    private final MemTableManager pullLogMemTableManager;
 
     private final MessageLog messageLog;
     private final ConsumerLogManager consumerLogManager;
@@ -74,6 +75,7 @@ public class DefaultStorage implements Storage {
 
     private final PeriodicFlushService messageLogFlushService;
     private final PeriodicFlushService actionLogFlushService;
+    private final SortedPullLogTable sortedPullLogTable;
 
     public DefaultStorage(final BrokerRole role, final StorageConfig config, final CheckpointLoader loader) {
         this.config = config;
@@ -84,22 +86,30 @@ public class DefaultStorage implements Storage {
         this.pullLogManager = new PullLogManager(config, checkpointManager.allConsumerGroupProgresses());
         this.actionLog = new ActionLog(config);
 
-        final int tabletSize = MessageLog.PER_SEGMENT_FILE_SIZE / 4;
-        this.sortedMessagesTable = new SortedMessagesTable(new File(config.getSMTStorePath()), tabletSize);
-        final EvictedMemTableHandler evictedCallback = new EvictedMemTableHandler(sortedMessagesTable, consumerLogManager, checkpointManager);
-        this.memTableManager = new MessageMemTableManager(config, tabletSize - sortedMessagesTable.getTabletMetaSize(), evictedCallback);
-
         // must init after offset manager created
         this.consumeQueueManager = new ConsumeQueueManager(this);
 
         this.pullLogFlusher = new PullLogFlusher(config, checkpointManager, pullLogManager);
+        this.sortedPullLogTable = new SortedPullLogTable(new File(config.getPullLogSMTStorePath()), PullLogMemTable.SEQUENCE_SIZE);
+        EvictedPullLogMemTableHandler evictedPullLogMemTableCallback = new EvictedPullLogMemTableHandler(sortedPullLogTable, checkpointManager);
+        this.pullLogMemTableManager = new MemTableManager(config, PullLogMemTable.SEQUENCE_SIZE, PullLogMemTable::new, evictedPullLogMemTableCallback);
         this.actionEventBus = new FixedExecOrderEventBus();
-        this.actionEventBus.subscribe(ActionEvent.class, new PullLogBuilder(this));
+        this.actionEventBus.subscribe(ActionEvent.class, new PullLogBuilder(config, pullLogMemTableManager));
         this.actionEventBus.subscribe(ActionEvent.class, new MaxSequencesUpdater(checkpointManager));
         this.actionEventBus.subscribe(ActionEvent.class, pullLogFlusher);
-        this.actionLogIterateService = new LogIterateService<>("ReplayActionLog", config.getLogDispatcherPauseMillis(), actionLog, checkpointManager.getActionCheckpointOffset(), actionEventBus);
+
+        //如果pull log table加载校验后有不完整的文件，则这些文件需要重新回放
+        long actionReplayState = sortedPullLogTable.getActionReplayState();
+        long actionCheckpointOffset = checkpointManager.getActionCheckpointOffset();
+        actionReplayState = actionReplayState == 0 ? actionCheckpointOffset : actionReplayState;
+        this.actionLogIterateService = new LogIterateService<>("ReplayActionLog", config.getLogDispatcherPauseMillis(), actionLog, actionReplayState, actionEventBus);
 
         this.consumerLogFlusher = new ConsumerLogFlusher(config, checkpointManager, consumerLogManager);
+
+        final int tabletSize = MessageLog.PER_SEGMENT_FILE_SIZE / 4;
+        this.sortedMessagesTable = new SortedMessagesTable(new File(config.getSMTStorePath()), tabletSize);
+        final EvictedMemTableHandler evictedCallback = new EvictedMemTableHandler(sortedMessagesTable, consumerLogManager, checkpointManager);
+        this.memTableManager = new MemTableManager(config, tabletSize - sortedMessagesTable.getTabletMetaSize(), MessageMemTable::new, evictedCallback);
         this.messageEventBus = new FixedExecOrderEventBus();
         if (config.isSMTEnable()) {
             this.messageEventBus.subscribe(MessageLogRecord.class, new BuildMessageMemTableEventListener(config, memTableManager, sortedMessagesTable));
@@ -127,7 +137,7 @@ public class DefaultStorage implements Storage {
         actionLogIterateService.blockUntilReplayDone();
         blockUntilSMTWriteComplete();
         // must call this after message log replay done
-        consumerLogManager.initConsumerLogOffset(memTableManager.latestMemTable());
+        consumerLogManager.initConsumerLogOffset((MessageMemTable) memTableManager.latestMemTable());
 
         logCleanerExecutor.scheduleAtFixedRate(
                 new LogCleaner(), 0, config.getLogRetentionCheckIntervalSeconds(), TimeUnit.SECONDS);
@@ -227,9 +237,9 @@ public class DefaultStorage implements Storage {
     }
 
     private GetMessageResult pollFromMemTable(String subject, long beginSequence, int maxMessages, MessageFilter filter) {
-        final Iterator<MessageMemTable> iter = memTableManager.iterator();
+        final Iterator<MemTable> iter = memTableManager.iterator();
         while (iter.hasNext()) {
-            final MessageMemTable table = iter.next();
+            final MessageMemTable table = (MessageMemTable) iter.next();
             final GetMessageResult result = table.poll(subject, beginSequence, maxMessages, filter);
             switch (result.getStatus()) {
                 case SUBJECT_NOT_FOUND:
@@ -399,21 +409,6 @@ public class DefaultStorage implements Storage {
     }
 
     @Override
-    public long getMaxMessageSequence(String subject) {
-        final Long maxMessageSequence = memTableManager.getMaxMessageSequence(subject);
-        if (maxMessageSequence != null) {
-            return maxMessageSequence + 1;
-        }
-
-        final ConsumerLog consumerLog = consumerLogManager.getConsumerLog(subject);
-        if (consumerLog == null) {
-            return 0;
-        } else {
-            return consumerLog.nextSequence();
-        }
-    }
-
-    @Override
     public PutMessageResult putAction(Action action) {
         return actionLog.addAction(action);
     }
@@ -426,8 +421,7 @@ public class DefaultStorage implements Storage {
 
     @Override
     public long getPullLogReplayState(String subject, String group, String consumerId) {
-        PullLog pullLog = pullLogManager.getOrCreate(subject, group, consumerId);
-        return pullLog.getMaxOffset();
+        return checkpointManager.getConsumerMaxPullLogSequence(subject, group, consumerId);
     }
 
     @Override
@@ -452,6 +446,16 @@ public class DefaultStorage implements Storage {
 
     @Override
     public long getMessageSequenceByPullLog(String subject, String group, String consumerId, long pullLogSequence) {
+        Iterator<MemTable> iterator = pullLogMemTableManager.iterator();
+        while (iterator.hasNext()) {
+            PullLogMemTable next = (PullLogMemTable) iterator.next();
+            long consumerLogSequence = next.getConsumerLogSequence(subject, group, consumerId, pullLogSequence);
+            if (consumerLogSequence >= 0) return consumerLogSequence;
+        }
+
+        long consumerLogSequence = sortedPullLogTable.getMessage(subject, group, consumerId, pullLogSequence);
+        if (consumerLogSequence >= 0) return consumerLogSequence;
+
         final PullLog log = pullLogManager.get(subject, group, consumerId);
         if (log == null) {
             return -1;
@@ -611,6 +615,7 @@ public class DefaultStorage implements Storage {
                 messageLog.clean();
                 consumerLogManager.clean();
                 pullLogManager.clean(allConsumerGroupProgresses().values());
+                sortedPullLogTable.clean(allConsumerGroupProgresses().values());
                 actionLog.clean();
                 sortedMessagesTable.clean(config, (logManager, deletedSegment) -> {
                     consumerLogManager.adjustConsumerLogMinOffsetForSMT(logManager.firstSegment());
